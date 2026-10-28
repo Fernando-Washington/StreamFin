@@ -24,3 +24,5 @@ debian/.debhelper
 cmake_log.txt
 *.nro
 *.nsp
+
+!/releases/*.nro

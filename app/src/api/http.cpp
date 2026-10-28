@@ -74,6 +74,15 @@ class curl_error : public std::exception {
 public:
     explicit curl_error(CURLcode code) : m(curl_easy_strerror(code)) {}
     explicit curl_error(const std::string& arg) : m(arg) {}
+    // Diagnostic variant: appends whatever CURLOPT_ERRORBUFFER text the
+    // backend gave (often empty on NSS/libnx) plus how far the connection
+    // got (TCP connect vs. TLS handshake complete) -- lets us tell an
+    // immediate/config-level failure apart from one that stalled mid-handshake.
+    curl_error(CURLcode code, const char* errbuf, double connectTime, double appConnectTime)
+        : m(curl_easy_strerror(code)) {
+        if (errbuf != nullptr && errbuf[0] != '\0') m += fmt::format(" [{}]", errbuf);
+        m += fmt::format(" (tcp_connect={:.2f}s tls_handshake={:.2f}s)", connectTime, appConnectTime);
+    }
     const char* what() const noexcept override { return m.c_str(); }
 
 private:
@@ -123,6 +132,19 @@ HTTP::HTTP() : chunk(nullptr) {
 #if LIBCURL_VERSION_NUM >= 0x071900 && !defined(__PS4__)
     curl_easy_setopt(this->easy, CURLOPT_TCP_KEEPALIVE, 1L);
 #endif
+    // Every TLS connection on Switch (libnx backend) holds an sslCreateContext
+    // slot, and the ssl: service only has a handful per process. The image
+    // workers keep their HTTP alive forever, so curl's default cache (5 idle
+    // connections per handle, ~118s each) parked up to 20 contexts on image
+    // hosts -- every other HTTPS request then failed instantly with "SSL
+    // connect error" until the idle ones aged out. Keep at most one idle
+    // connection per handle, and drop it quickly.
+    curl_easy_setopt(this->easy, CURLOPT_MAXCONNECTS, 1L);
+#if LIBCURL_VERSION_NUM >= 0x074100
+    curl_easy_setopt(this->easy, CURLOPT_MAXAGE_CONN, 15L);
+#endif
+    this->errorBuffer[0] = '\0';
+    curl_easy_setopt(this->easy, CURLOPT_ERRORBUFFER, this->errorBuffer);
 }
 
 HTTP::~HTTP() {
@@ -206,9 +228,15 @@ int HTTP::perform(std::ostream* body) {
     curl_easy_setopt(this->easy, CURLOPT_WRITEFUNCTION, easy_write_cb);
     curl_easy_setopt(this->easy, CURLOPT_WRITEDATA, body);
     curl_easy_setopt(this->easy, CURLOPT_PROXY, PROXY_STATUS ? PROXY.c_str() : nullptr);
+    this->errorBuffer[0] = '\0';
 
     CURLcode res = curl_easy_perform(this->easy);
-    if (res != CURLE_OK) throw curl_error(res);
+    if (res != CURLE_OK) {
+        double connectTime = 0, appConnectTime = 0;
+        curl_easy_getinfo(this->easy, CURLINFO_CONNECT_TIME, &connectTime);
+        curl_easy_getinfo(this->easy, CURLINFO_APPCONNECT_TIME, &appConnectTime);
+        throw curl_error(res, this->errorBuffer, connectTime, appConnectTime);
+    }
 
     long status_code = 0;
     curl_easy_getinfo(this->easy, CURLINFO_RESPONSE_CODE, &status_code);

@@ -1,6 +1,7 @@
 #include <borealis.hpp>
 
 #include "utils/config.hpp"
+#include "utils/debug_log.hpp"
 #include "utils/download.hpp"
 #include "utils/thread.hpp"
 #include "api/analytics.hpp"
@@ -9,7 +10,6 @@
 
 #include "view/svg_image.hpp"
 #include "view/custom_button.hpp"
-#include "view/context_menu.hpp"
 #include "view/auto_tab_frame.hpp"
 #include "view/recycling_grid.hpp"
 #include "view/h_recycling.hpp"
@@ -23,6 +23,7 @@
 #include "view/text_box.hpp"
 #include "view/icon_button.hpp"
 #include "view/mpv_core.hpp"
+#include "view/context_menu.hpp"
 
 #include "activity/main_activity.hpp"
 #include "activity/server_list.hpp"
@@ -67,6 +68,10 @@ int main(int argc, char* argv[]) {
     if (!conf.init()) {
         return 0;
     }
+    // Dev-only: mirror all logging to a persistent file on the SD card so
+    // crashes/hangs that require a forced restart don't lose the trail.
+    // No-op (compiles out) when STREAMFIN_DEBUG_LOG is off.
+    DebugLog::init();
     // Load the user's stream addon URL (set on first launch via the UI), then
     // let a streamfin-addon.txt dropped on the SD card set/override it — much
     // easier than typing a long URL on the on-screen keyboard.

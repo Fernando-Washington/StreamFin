@@ -9,12 +9,40 @@
 #include "client/local.hpp"
 #include "utils/misc.hpp"
 #include "utils/config.hpp"
+#include "utils/autoplay.hpp"
+#include "utils/intro_markers.hpp"
+#include "utils/sub_loader.hpp"
+#include "utils/theme.hpp"
+
+// mpv_core.hpp pulls in windows.h (via glad.h) *after* borealis/core/view.hpp
+// already did its own "#undef ABSOLUTE" -- windows.h's own ABSOLUTE macro
+// (wingdi.h, graphics mode constant) comes back and shadows
+// brls::PositionType::ABSOLUTE below. Same fix borealis uses internally.
+#ifdef ABSOLUTE
+#undef ABSOLUTE
+#endif
 
 using namespace brls::literals;
 
 class RemotePlayer : public brls::Box {
 public:
-    RemotePlayer(const remote::DirEntry& item) {
+    // `streamId` ("ttID:season:episode" for a series episode) is what lets
+    // the intro-skip markers below be scoped to "this season", not the whole
+    // app -- see utils/intro_markers.hpp. Left empty for anything that isn't
+    // a Stremio series episode (movies, downloads without series context,
+    // webdav, ...), which quietly disables both marking and the auto-prompt.
+    RemotePlayer(const remote::DirEntry& item, const std::string& streamId = "") {
+        size_t p1 = streamId.find(':');
+        size_t p2 = (p1 == std::string::npos) ? std::string::npos : streamId.find(':', p1 + 1);
+        if (p1 != std::string::npos && p2 != std::string::npos) {
+            this->seriesId = streamId.substr(0, p1);
+            try {
+                this->seasonIndex = std::stoi(streamId.substr(p1 + 1, p2 - p1 - 1));
+            } catch (...) {
+                this->seriesId.clear();
+            }
+        }
+
         float width = brls::Application::contentWidth;
         float height = brls::Application::contentHeight;
         view->setDimensions(width, height);
@@ -25,6 +53,31 @@ public:
         view->hideVideoQuality();
         this->setDimensions(width, height);
         this->addView(view);
+
+        // Bottom-left "Skip intro?" prompt, shown automatically once the
+        // season has markers (see the UPDATE_PROGRESS case below). Built once
+        // and toggled, not recreated each time, since it can show up many
+        // times across a binge session.
+        this->introToast = new brls::Box();
+        this->introToast->setPositionType(brls::PositionType::ABSOLUTE);
+        this->introToast->setPositionBottom(40);
+        this->introToast->setPositionLeft(40);
+        this->introToast->setAxis(brls::Axis::COLUMN);
+        this->introToast->setPadding(14, 20, 14, 20);
+        this->introToast->setCornerRadius(8);
+        this->introToast->setBackgroundColor(theme::BG_CARD);
+        this->introToast->setVisibility(brls::Visibility::GONE);
+        auto* introTitle = new brls::Label();
+        introTitle->setText("Skip intro?");
+        introTitle->setFontSize(20);
+        introTitle->setTextColor(theme::TEXT_PRIMARY);
+        introTitle->setMarginBottom(4);
+        this->introToast->addView(introTitle);
+        this->introToastCountdown = new brls::Label();
+        this->introToastCountdown->setFontSize(16);
+        this->introToastCountdown->setTextColor(theme::TEXT_SECONDARY);
+        this->introToast->addView(this->introToastCountdown);
+        this->addView(this->introToast);
 
         if (item.type == remote::EntryType::PLAYLIST) {
             view->hideVideoProgressSlider();
@@ -43,6 +96,19 @@ public:
                 for (auto& it : this->subtitles) {
                     mpv.command("sub-add", it.second.c_str(), flag, it.first.c_str());
                 }
+                this->introToastShownThisPlayback = false;
+                this->pendingIntroMarkStart = -1;
+                break;
+            }
+            case MpvEventEnum::UPDATE_PROGRESS: {
+                if (this->seriesId.empty() || this->introToastShownThisPlayback || *this->introToastActive) break;
+                IntroMarkers::Marker marker;
+                if (!IntroMarkers::instance().get(this->seriesId, this->seasonIndex, marker)) break;
+                if (mpv.playback_time >= marker.start && mpv.playback_time < marker.end) {
+                    this->introToastShownThisPlayback = true;
+                    this->introMarkerEnd = marker.end;
+                    this->showIntroToast();
+                }
                 break;
             }
             default:;
@@ -52,6 +118,68 @@ public:
             brls::View* setting = new PlayerSetting();
             brls::Application::pushActivity(new brls::Activity(setting));
         });
+        // ZR is dual-purpose, both hidden from the OSD hint bar: if the
+        // auto-prompt is showing, ZR confirms it (skip to the marked end);
+        // otherwise, on a series episode, it captures a mark -- the first
+        // press is "intro starts here", the second is "intro ends here",
+        // saved for the whole season. Re-pressing after a save just starts a
+        // fresh mark, in case the first attempt was off.
+        this->registerAction("", brls::BUTTON_RT, [this](brls::View*) {
+            auto& mpv = MPVCore::instance();
+            if (*this->introToastActive) {
+                *this->introToastActive = false;
+                this->introToast->setVisibility(brls::Visibility::GONE);
+                mpv.seek(this->introMarkerEnd, "absolute");
+                brls::Application::notify("Skipped intro");
+                return true;
+            }
+            if (this->seriesId.empty()) return false;
+            if (this->pendingIntroMarkStart < 0) {
+                this->pendingIntroMarkStart = mpv.playback_time;
+                brls::Application::notify(
+                    fmt::format("Intro start marked at {:.0f}s -- press ZR again where it ends",
+                        this->pendingIntroMarkStart));
+            } else {
+                double start = this->pendingIntroMarkStart;
+                double end = mpv.playback_time;
+                this->pendingIntroMarkStart = -1;
+                if (end <= start) {
+                    brls::Application::notify("Intro end must be after the start -- try again");
+                    return true;
+                }
+                IntroMarkers::instance().set(this->seriesId, this->seasonIndex, start, end);
+                brls::Application::notify(
+                    fmt::format("Intro markers saved for this season: {:.0f}s-{:.0f}s", start, end));
+            }
+            return true;
+        });
+    }
+
+    // Shows the bottom-left prompt and counts down 5s on its own; ZR (above)
+    // confirms early, otherwise it just hides once time's up and the intro
+    // plays out normally -- either way this playback's one-shot flag (set by
+    // the caller) keeps it from popping up again for the same episode.
+    void showIntroToast() {
+        *this->introToastActive = true;
+        this->introToast->setVisibility(brls::Visibility::VISIBLE);
+        auto secondsLeft = std::make_shared<int>(5);
+        this->introToastCountdown->setText(fmt::format("ZR to skip · {}s", *secondsLeft));
+
+        auto active = this->introToastActive;
+        brls::Box* toast = this->introToast;
+        brls::Label* label = this->introToastCountdown;
+        auto tick = std::make_shared<std::function<void()>>();
+        *tick = [active, secondsLeft, toast, label, tick]() {
+            if (!*active) return;  // confirmed via ZR already
+            if (--(*secondsLeft) <= 0) {
+                *active = false;
+                toast->setVisibility(brls::Visibility::GONE);
+                return;
+            }
+            label->setText(fmt::format("ZR to skip · {}s", *secondsLeft));
+            brls::delay(1000, *tick);
+        };
+        brls::delay(1000, *tick);
     }
 
     ~RemotePlayer() override {
@@ -60,6 +188,21 @@ public:
         view->getPlayEvent()->unsubscribe(playSubscribeID);
         view->getSettingEvent()->unsubscribe(settingSubscribeID);
         mpv.command("write-watch-later-config");
+        // If this player suppressed its own end-of-file close for autoplay
+        // (see setUrl() above) but is being destroyed anyway -- e.g. the user
+        // pressed B while the next-episode lookup was still in flight --
+        // invalidate that lookup/dialog so it doesn't act on some other
+        // screen. Comparing generations (instead of unconditionally calling
+        // disarm()) is what keeps this from also firing on the NORMAL
+        // successful chain: there, AutoplayManager::startPlayback() pops this
+        // same activity, but only after its completion callback already
+        // called arm() for the new episode -- Application::popActivity runs
+        // that callback BEFORE freeing/deleting the old activity -- so the
+        // generation has already moved on and this correctly does nothing.
+        if (this->autoplaySuppressedClose &&
+            this->autoplayGenAtEOF == AutoplayManager::instance().currentGeneration()) {
+            AutoplayManager::instance().disarm();
+        }
     }
 
 #ifdef ANDROID
@@ -119,7 +262,25 @@ public:
     }
 
     void setUrl(const std::string& path) {
-        playSubscribeID = view->getPlayEvent()->subscribe([](int index) { return VideoView::close(true); });
+        // No explicit reset() here: `view` is a freshly-constructed VideoView
+        // (see its ctor) which already calls MPVCore::reset() once. A second
+        // reset() here just queues a redundant async "stop" -- since stop is
+        // async, its MPV_STOP could arrive late, after this title's own
+        // setCurrent()/SubLoader::prepare() already ran, and wipe out ITS
+        // resume/subtitle state instead of the old title's.
+        playSubscribeID = view->getPlayEvent()->subscribe([this](int index) {
+            auto& autoplay = AutoplayManager::instance();
+            if (autoplay.willHandle()) {
+                // It owns the transition from here (hold this frozen frame,
+                // show "up next", chain or close itself once it knows there's
+                // nothing to offer). Remember the generation so the
+                // destructor below can tell whether that actually happened.
+                this->autoplaySuppressedClose = true;
+                this->autoplayGenAtEOF = autoplay.currentGeneration();
+                return true;
+            }
+            return VideoView::close(true);
+        });
         MPVCore::instance().setUrl(path);
     }
 
@@ -152,6 +313,17 @@ private:
     MPVEvent::Subscription eventSubscribeID;
     brls::Event<int>::Subscription playSubscribeID;
     brls::VoidEvent::Subscription settingSubscribeID;
+    bool autoplaySuppressedClose = false;
+    int autoplayGenAtEOF = 0;
+
+    std::string seriesId;
+    int seasonIndex = 0;
+    double pendingIntroMarkStart = -1;
+    double introMarkerEnd = 0;
+    bool introToastShownThisPlayback = false;
+    std::shared_ptr<bool> introToastActive = std::make_shared<bool>(false);
+    brls::Box* introToast = nullptr;
+    brls::Label* introToastCountdown = nullptr;
 };
 
 class FileCard : public RecyclingGridItem {
@@ -394,8 +566,20 @@ RecyclingGrid* RemoteView::newRecycler() {
     return view;
 }
 
-void RemoteView::play(const std::string& path, const std::string& name) {
-    RemotePlayer* view = new RemotePlayer({remote::EntryType::VIDEO, name, path});
+void RemoteView::play(const std::string& path, const std::string& name, const std::string& streamId) {
+    // Default to no autoplay-next-episode for whatever's about to play; the
+    // Stremio stream picker re-arms it right after this call for series
+    // episodes specifically. Without this, a stale arm from a previously
+    // watched episode could fire a "next episode" countdown over an unrelated
+    // video (a downloaded movie, a webdav file, ...) that just happens to end.
+    AutoplayManager::instance().disarm();
+    // Same reasoning for subtitles: a request left in flight from whatever
+    // played before (Stremio streams call SubLoader::prepare() themselves
+    // right after this) would otherwise attach a stale, wrong-title subtitle
+    // to this playback once it resolves -- most relevantly, opening a
+    // download or webdav file never calls prepare() itself.
+    SubLoader::instance().cancelPending();
+    RemotePlayer* view = new RemotePlayer({remote::EntryType::VIDEO, name, path}, streamId);
     brls::Application::pushActivity(new brls::Activity(view), brls::TransitionAnimation::NONE);
     view->setUrl(path);
 }

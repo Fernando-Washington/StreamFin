@@ -2479,6 +2479,11 @@ void View::setId(std::string id)
     this->id = id;
 }
 
+std::string View::getId()
+{
+    return this->id;
+}
+
 bool View::isFocusable()
 {
     return this->focusable && this->visibility == Visibility::VISIBLE;

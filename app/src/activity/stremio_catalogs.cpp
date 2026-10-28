@@ -9,6 +9,7 @@
 #include "view/recycling_grid.hpp"
 #include "api/stremio.hpp"
 #include "utils/config.hpp"
+#include "utils/theme.hpp"
 
 #include <algorithm>
 
@@ -63,7 +64,7 @@ public:
         float t = this->anim;
         // Track: grey when off, brand red when on.
         NVGcolor off = this->onRedCard ? nvgRGBA(255, 255, 255, 110) : nvgRGB(120, 120, 128);
-        NVGcolor on = this->onRedCard ? nvgRGB(128, 9, 15) : nvgRGB(245, 33, 42);
+        NVGcolor on = this->onRedCard ? nvgRGB(128, 9, 15) : theme::ACCENT;
         NVGcolor track = nvgRGBAf(off.r + (on.r - off.r) * t, off.g + (on.g - off.g) * t,
             off.b + (on.b - off.b) * t, this->getAlpha());
         nvgBeginPath(vg);
@@ -154,7 +155,7 @@ public:
     void setHeld(bool held) {
         brls::Theme theme = brls::Application::getTheme();
         if (held) {
-            this->setBackgroundColor(nvgRGB(245, 33, 42));
+            this->setBackgroundColor(theme::ACCENT);
             this->name->setTextColor(nvgRGB(255, 255, 255));
             this->detail->setTextColor(nvgRGBA(255, 235, 236, 220));
         } else {

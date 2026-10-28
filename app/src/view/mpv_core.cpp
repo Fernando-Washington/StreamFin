@@ -6,6 +6,9 @@
 #include "utils/config.hpp"
 #include "utils/misc.hpp"
 #include <fmt/ranges.h>
+#if defined(__SWITCH__)
+#include "view/curl_stream.hpp"
+#endif
 
 static inline void check_error(int status) {
     if (status < 0) brls::Logger::error("MPV ERROR => {}", mpv_error_string(status));
@@ -136,6 +139,11 @@ void MPVCore::init() {
     mpv_set_option_string(mpv, "osd-level", "0");
     mpv_set_option_string(mpv, "video-timing-offset", "0");  // 60fps
     mpv_set_option_string(mpv, "reset-on-next-file", "speed,pause");
+    // Hold the last frame instead of going black/idle at natural end of file --
+    // needed so the "next episode" countdown overlay has something to sit on
+    // top of. loadfile-ing the next episode still replaces it immediately;
+    // an explicit stop (backing out) still unloads regardless of this.
+    mpv_set_option_string(mpv, "keep-open", "yes");
     mpv_set_option_string(mpv, "subs-fallback", SUBS_FALLBACK ? "yes" : "no");
     mpv_set_option_string(mpv, "vo", MPVCore::VO.c_str());
 #if defined(__PS4__) || defined(__PSV__) || defined(TRIMUI)
@@ -222,6 +230,14 @@ void MPVCore::init() {
         mpv_terminate_destroy(mpv);
         brls::fatal("Could not initialize mpv context");
     }
+
+#if defined(__SWITCH__)
+    // switch-ffmpeg ships with no TLS backend at all, so mpv can't open an
+    // https:// URL on its own -- every debrid/stream link is https. Route
+    // those reads through our own curl (which has working TLS via the
+    // console's ssl service) instead. See view/curl_stream.hpp for why.
+    registerCurlHttpsStream(mpv);
+#endif
 
     this->setAspect(VIDEO_ASPECT);
 

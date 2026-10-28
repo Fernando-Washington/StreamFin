@@ -9,6 +9,8 @@
 
 #include <borealis.hpp>
 #include "api/stremio.hpp"
+#include "utils/download.hpp"
+#include <memory>
 
 class RecyclingGrid;
 
@@ -32,7 +34,30 @@ class StremioSeason : public brls::Box {
 public:
     StremioSeason(const std::string& seriesName, const std::string& title,
         const std::vector<stremio::Video>& episodes, const std::string& background);
+    ~StremioSeason() override;
+
+    void willAppear(bool resetState = false) override;
 
 private:
+    void startSeasonDownload();
+    void queueNextEpisode();
+    void refreshProgress();
+    // Updates the "watched" checkmark on episode cells currently mounted on
+    // screen -- called on willAppear (e.g. returning from watching an
+    // episode) without resetting scroll position the way reloadData() would.
+    void refreshWatchedBadges();
+
     RecyclingGrid* recycler = nullptr;
+    brls::Label* downloadLabel = nullptr;
+    brls::Label* progressLabel = nullptr;
+    std::string seriesName;
+    std::string seriesId;
+    std::string background;
+    std::vector<stremio::Video> episodes;
+    size_t nextEpisode = 0;
+    size_t unavailable = 0;
+    bool seasonRunning = false;
+    bool automatic = true;
+    std::shared_ptr<bool> alive = std::make_shared<bool>(true);
+    DownloadManager::StatusEvent::Subscription statusSubscription;
 };

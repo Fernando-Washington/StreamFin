@@ -4,6 +4,8 @@
 #include "activity/stremio_resume.hpp"
 #include "view/mpv_core.hpp"
 #include "utils/config.hpp"
+#include "utils/watched.hpp"
+#include "utils/smart_downloads.hpp"
 
 #include <fstream>
 #include <sys/stat.h>
@@ -39,6 +41,15 @@ void ResumeTracker::init() {
         }
         case MpvEventEnum::MPV_STOP:
         case MpvEventEnum::END_OF_FILE:
+        case MpvEventEnum::MPV_FILE_ERROR:
+            // MPV_FILE_ERROR isn't just "never started" -- a dropped
+            // connection well into playback ends the same way (mpv_core.cpp's
+            // MPV_END_FILE_REASON_ERROR branch), and that position is worth
+            // keeping. onProgress()'s own `pos < 60` guard already covers the
+            // "never really played" case (mpv.playback_time is reset to 0 for
+            // every new title by MPVCore::reset(), so a source that fails
+            // before ever producing a real position can't wrongly inherit a
+            // previous title's leftover time here).
             if (this->hasCurrent) this->onProgress(mpv.playback_time, mpv.duration, true);
             this->hasCurrent = false;
             break;
@@ -60,10 +71,41 @@ void ResumeTracker::setCurrent(const ResumeEntry& e) {
         }
 }
 
+namespace {
+// Series episodes routinely have a minute or more of credits (sometimes with
+// a post-credits scene) after the part someone actually came to watch --
+// counting that against "watched" would mean the checkmark/Smart Downloads
+// never fire until the credits finish rolling. Movies don't get the same
+// early cutoff: they're not part of Smart Downloads' delete-and-queue-next
+// flow, and a stray "watched" checkmark has no UI to show up in anyway, so
+// there's no upside to the risk of calling a movie done too early.
+constexpr double SERIES_WATCHED_THRESHOLD = 0.80;
+// Regardless of type, this is when an entry stops needing to be resumable at
+// all and drops out of Continue Watching.
+constexpr double FINISHED_THRESHOLD = 0.92;
+}  // namespace
+
 void ResumeTracker::onProgress(double pos, double dur, bool fire) {
     if (pos < 60) return;  // ignore < 1 minute watched
-    if (dur > 0 && pos / dur >= 0.92) {
-        this->removeId(this->current.streamId);  // finished -> drop
+    bool hasDuration = dur > 0;
+    double ratio = hasDuration ? pos / dur : 0;
+    bool finished = hasDuration && ratio >= FINISHED_THRESHOLD;
+    bool watched = finished ||
+        (this->current.streamType == "series" && hasDuration && ratio >= SERIES_WATCHED_THRESHOLD);
+
+    // "Watched" (checkmark, Smart Downloads) and "still resumable" (Continue
+    // Watching) are independent on purpose: crossing 80% of an episode marks
+    // it watched and can trigger Smart Downloads right away, but if the
+    // person reopens it before FINISHED_THRESHOLD -- to catch a post-credits
+    // scene, say -- it still resumes from exactly where they left off
+    // instead of restarting or having nothing to resume from.
+    if (watched && !WatchedTracker::instance().isWatched(this->current.streamId)) {
+        WatchedTracker::instance().markWatched(this->current.streamId);
+        SmartDownloads::onEpisodeWatched(this->current);
+    }
+
+    if (finished) {
+        this->removeId(this->current.streamId);
     } else {
         ResumeEntry e = this->current;
         e.position = pos;
@@ -144,7 +186,11 @@ void ResumeTracker::load() {
 
 void ResumeTracker::save() {
     std::string dir = AppConfig::instance().configDir();
+#ifdef _WIN32
+    ::mkdir(dir.c_str());
+#else
     ::mkdir(dir.c_str(), 0777);
+#endif
     try {
         std::ofstream out(dir + "/resume.json");
         if (out.is_open()) {

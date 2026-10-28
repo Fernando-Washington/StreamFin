@@ -16,6 +16,14 @@
 #include "api/http.hpp"
 
 #include <thread>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <stdexcept>
+#include <curl/curl.h>
+#include <functional>
+#include <random>
 #include <chrono>
 #include <ctime>
 #include <fstream>
@@ -60,7 +68,7 @@ inline std::vector<std::string> jstrlist(const nlohmann::json& j, const char* ke
 // Cinemeta: public catalog + metadata addon (browse / search / details).
 inline const std::string CINEMETA = "https://v3-cinemeta.strem.io";
 
-// The user's stream addons (AIOStreams, Torrentio, or anything implementing
+// The user's stream addons (any addon implementing
 // the Stremio "stream" resource). Each base is everything BEFORE
 // "/manifest.json". Stream requests look like:
 //   {addon}/stream/movie/{imdbId}.json
@@ -203,7 +211,11 @@ inline std::string posterUrl(const std::string& id, const std::string& fallback)
 inline std::string addonConfigPath(const std::string& configDir) { return configDir + "/stremio_addon.json"; }
 
 inline void saveConfig(const std::string& configDir) {
+#ifdef _WIN32
+    ::mkdir(configDir.c_str());
+#else
     ::mkdir(configDir.c_str(), 0777);
+#endif
     try {
         nlohmann::json rows = nlohmann::json::array();
         for (auto& r : CATALOG_ROWS)
@@ -347,7 +359,19 @@ inline void getJSON(std::function<void(Result)> then, OnError error, const std::
             } catch (const std::exception& ex) {
                 lastErr = ex.what();
             }
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (attempt < 2) {
+                // Plain local, not static/thread_local (see utils/image.cpp).
+                // mt19937, not minstd_rand: a real crash dump traced a hard
+                // fault into minstd_rand's internal modulus reduction on this
+                // Switch toolchain; mt19937 is already used elsewhere in this
+                // codebase (misc::randHex) and known to work there.
+                std::mt19937 rng(static_cast<unsigned>(
+                    std::chrono::steady_clock::now().time_since_epoch().count() ^
+                    std::hash<std::thread::id>{}(std::this_thread::get_id())));
+                const int baseMs = 500 << attempt;
+                const int delayMs = baseMs + std::uniform_int_distribution<int>(0, baseMs)(rng);
+                std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+            }
         }
         if (error) brls::sync(std::bind(error, lastErr));
     });
@@ -505,11 +529,11 @@ inline void from_json(const nlohmann::json& j, SubtitleList& l) {
     }
 }
 
-// A single playable result from a stream addon (AIOStreams).
+// A single playable result from a stream addon (stream addon).
 struct Stream {
     std::string name;         // source/quality label
     std::string title;        // detailed label (older addons)
-    std::string description;  // detailed label (newer addons, incl. AIOStreams)
+    std::string description;  // detailed label (newer addons)
     std::string url;          // <-- the playable (debrid) URL we hand to MPV
     std::string infoHash;     // raw torrent result (no debrid) — not playable here
 };
@@ -527,63 +551,239 @@ struct StreamList {
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(StreamList, streams);
 
-// Fetch /stream/{type}/{id}.json from EVERY configured addon in parallel and
-// merge the results in addon order (first addon in the file wins ties).
-// Duplicate stream URLs are dropped — AIOStreams commonly wraps Torrentio, so
-// the same debrid link can come back from both. Per-addon failures are
-// tolerated: the merged list is delivered as long as at least one addon
-// answered; error() fires only when every addon failed. All getJSON callbacks
-// arrive on the UI thread, so the shared state needs no locking.
-inline void getStreams(const std::string& type, const std::string& id,
-    std::function<void(std::vector<Stream>)> then, OnError error) {
-    struct Agg {
-        std::vector<std::vector<Stream>> results;
-        size_t pending;
-        bool anyOk = false;
-        std::string lastErr;
+// Prefer an instantly-available (debrid-cached) stream over one that would
+// need to fetch/cache first -- shared by every place that auto-picks a
+// stream without asking the user (season auto-download, autoplay's next
+// episode, Smart Downloads). Returns nullptr if `streams` has no usable URL.
+inline const Stream* pickBestStream(const std::vector<Stream>& streams) {
+    auto it = std::find_if(streams.begin(), streams.end(),
+        [](const Stream& s) { return !s.url.empty() && s.name.find("⚡") != std::string::npos; });
+    if (it == streams.end())
+        it = std::find_if(streams.begin(), streams.end(), [](const Stream& s) { return !s.url.empty(); });
+    return it == streams.end() ? nullptr : &*it;
+}
+
+// Dedicated stream-addon workers. brls::async has one serial worker, and the
+// image pool also handles unrelated jobs. Three workers bound concurrent stream
+// TLS requests across all getStreams() calls (including autoplay/downloads).
+namespace detail {
+class StreamRequestPool {
+public:
+    using Job = std::function<void()>;
+
+    StreamRequestPool() {
+        try {
+            for (int i = 0; i < 3; ++i)
+                workers.emplace_back([this]() { run(); });
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                stopping = true;
+            }
+            ready.notify_all();
+            for (auto& worker : workers) worker.join();
+            throw;
+        }
+    }
+
+    ~StreamRequestPool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+            jobs.clear();
+        }
+        ready.notify_all();
+        for (auto& worker : workers) worker.join();
+    }
+
+    void submit(Job job) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            jobs.push_back(std::move(job));
+        }
+        ready.notify_one();
+    }
+
+private:
+    void run() {
+        for (;;) {
+            Job job;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                ready.wait(lock, [this]() { return stopping || !jobs.empty(); });
+                if (stopping) return;
+                job = std::move(jobs.front());
+                jobs.pop_front();
+            }
+            try {
+                job();
+            } catch (const std::exception& ex) {
+                brls::Logger::warning("stream worker error: {}", ex.what());
+            }
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::deque<Job> jobs;
+    std::vector<std::thread> workers;
+    bool stopping = false;
+};
+
+inline StreamRequestPool& streamRequestPool() {
+    static StreamRequestPool pool;
+    return pool;
+}
+
+inline std::string streamAddonHost(const std::string& url) {
+    size_t scheme = url.find("://");
+    size_t start = scheme == std::string::npos ? 0 : scheme + 3;
+    size_t end = url.find_first_of("/?#", start);
+    std::string host = url.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    size_t credentials = host.rfind('@');
+    if (credentials != std::string::npos) host.erase(0, credentials + 1);
+    return host.empty() ? "(invalid URL)" : host;
+}
+
+inline bool immediateConnectFailure(const std::string& error, long elapsedMs) {
+    if (elapsedMs >= 1000) return false;
+    auto isCode = [&error](CURLcode code) {
+        const char* message = curl_easy_strerror(code);
+        return error.compare(0, std::strlen(message), message) == 0;
     };
-    if (STREAM_ADDONS.empty()) {  // call sites check first; belt-and-braces
+    return isCode(CURLE_SSL_CONNECT_ERROR) || isCode(CURLE_COULDNT_CONNECT) ||
+        isCode(CURLE_COULDNT_RESOLVE_HOST);
+}
+}  // namespace detail
+
+using OnStreamPartial = std::function<void(std::vector<Stream>, size_t pending)>;
+using OnStreamsDone = std::function<void()>;
+
+// Each successful addon delivers only new streams on the UI thread. Results
+// keep arrival order and are never reordered after the user starts browsing.
+// onDone runs once when every addon finishes or twelve seconds elapse; error
+// runs only if no addon answered successfully (including empty responses).
+inline void getStreams(const std::string& type, const std::string& id,
+    OnStreamPartial onPartial, OnStreamsDone onDone, OnError error) {
+    auto addons = STREAM_ADDONS;  // configuration can change while jobs run
+    if (addons.empty()) {
         if (error) error("no stream addon configured");
+        if (onDone) onDone();
         return;
     }
-    auto agg = std::make_shared<Agg>();
-    agg->results.resize(STREAM_ADDONS.size());
-    agg->pending = STREAM_ADDONS.size();
 
-    auto finish = [agg, then, error]() {
-        if (--agg->pending > 0) return;
-        std::vector<Stream> merged;
+    struct Agg {
+        size_t pending = 0;
+        bool anyOk = false;
+        std::string lastErr = "stream addons timed out";
         std::set<std::string> seen;
-        for (auto& r : agg->results)
-            for (auto& s : r)
-                if (s.url.empty() || seen.insert(s.url).second) merged.push_back(s);
-        if (!agg->anyOk) {
-            if (error) error(agg->lastErr);
-            return;
-        }
-        if (then) then(std::move(merged));
+        std::atomic_bool delivered{false};
+        OnStreamPartial onPartial;
+        OnStreamsDone onDone;
+        OnError error;
+    };
+    auto agg = std::make_shared<Agg>();
+    agg->pending = addons.size();
+    agg->onPartial = std::move(onPartial);
+    agg->onDone = std::move(onDone);
+    agg->error = std::move(error);
+
+    // Workers only read delivered. All other aggregate state and callbacks
+    // stay on the UI thread via brls::sync / brls::delay.
+    auto finish = [agg]() {
+        if (agg->delivered.exchange(true)) return;
+        if (!agg->anyOk && agg->error) agg->error(agg->lastErr);
+        auto done = std::move(agg->onDone);
+        if (done) done();
     };
 
-    for (size_t i = 0; i < STREAM_ADDONS.size(); ++i) {
-        std::string url = STREAM_ADDONS[i] + "/stream/" + type + "/" + id + ".json";
-        getJSON<StreamList>(
-            [agg, i, finish](StreamList r) {
-                agg->results[i] = std::move(r.streams);
-                agg->anyOk = true;
-                finish();
-            },
-            [agg, finish](const std::string& e) {
-                agg->lastErr = e;
-                finish();
-            },
-            url);
+    brls::delay(12000, finish);
+    try {
+        auto& pool = detail::streamRequestPool();
+        for (size_t i = 0; i < addons.size(); ++i) {
+            std::string host = detail::streamAddonHost(addons[i]);
+            std::string url = addons[i] + "/stream/" + type + "/" + id + ".json";
+            pool.submit([agg, finish, host, url]() {
+                if (agg->delivered.load()) return;
+                auto started = std::chrono::steady_clock::now();
+                std::string lastErr = "request failed";
+                for (int attempt = 0; attempt < 2; ++attempt) {
+                    if (agg->delivered.load()) return;
+                    auto attemptStarted = std::chrono::steady_clock::now();
+                    try {
+                        auto response = HTTP::get(url, HTTP::Timeout{8000});
+                        if (response.empty()) throw std::runtime_error("empty response");
+                        auto streams = nlohmann::json::parse(response).get<StreamList>().streams;
+                        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - started).count();
+                        brls::Logger::info("stream addon {} -> {} streams in {}ms", host, streams.size(), elapsed);
+                        brls::sync([agg, finish, streams = std::move(streams)]() mutable {
+                            if (agg->delivered.load()) return;
+                            agg->anyOk = true;
+                            std::vector<Stream> fresh;
+                            for (auto& stream : streams) {
+                                std::string key = !stream.url.empty() ? "url:" + stream.url
+                                    : !stream.infoHash.empty() ? "hash:" + stream.infoHash
+                                    : "label:" + stream.name + "|" + stream.title + "|" + stream.description;
+                                if (agg->seen.insert(std::move(key)).second)
+                                    fresh.push_back(std::move(stream));
+                            }
+                            --agg->pending;
+                            if (agg->onPartial) agg->onPartial(std::move(fresh), agg->pending);
+                            if (agg->pending == 0) finish();
+                        });
+                        return;
+                    } catch (const std::exception& ex) {
+                        lastErr = ex.what();
+                        auto attemptMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - attemptStarted).count();
+                        if (attempt == 0 && detail::immediateConnectFailure(lastErr, attemptMs)) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started).count();
+                brls::Logger::warning("stream addon {} failed in {}ms: {}", host, elapsed, lastErr);
+                brls::sync([agg, finish, lastErr = std::move(lastErr)]() {
+                    if (agg->delivered.load()) return;
+                    agg->lastErr = lastErr;
+                    if (--agg->pending == 0) finish();
+                });
+            });
+        }
+    } catch (const std::exception& ex) {
+        agg->lastErr = ex.what();
+        finish();
     }
+}
+
+// Existing non-picker consumers (autoplay, Smart Downloads, season queue)
+// still need one merged result after completion, not every partial batch.
+inline void getStreams(const std::string& type, const std::string& id,
+    std::function<void(std::vector<Stream>)> then, OnError error) {
+    struct Legacy {
+        std::vector<Stream> streams;
+        bool anyOk = false;
+    };
+    auto state = std::make_shared<Legacy>();
+    getStreams(type, id,
+        [state](std::vector<Stream> fresh, size_t) {
+            state->anyOk = true;
+            for (auto& stream : fresh) state->streams.push_back(std::move(stream));
+        },
+        [state, then = std::move(then)]() mutable {
+            if (state->anyOk && then) then(std::move(state->streams));
+        },
+        std::move(error));
 }
 
 // ---------------------------------------------------------------------------
 // Stream display parsing (for a clean, readable picker)
 //
-// AIOStreams packs everything (source, quality, codec, audio, size, duration,
+// Aggregator addons pack everything (source, quality, codec, audio, size, duration,
 // and a long country/language list) into one description blob. parseStream()
 // pulls out the useful bits so the UI can show a tidy title + a few tags
 // instead of one giant run-on line. Everything is best-effort: if a field
@@ -595,7 +795,7 @@ struct StreamInfo {
     std::vector<std::string> audio;   // audio codecs + channel layout
     std::vector<std::string> langs;   // AUDIO languages (e.g. {"PL","GB"})
     std::vector<std::string> badges;  // quality flags: 4K / HDR / HDR10+ / DV
-    std::string source;               // tracker/indexer, e.g. "The Pirate Bay"
+    std::string source;               // tracker/indexer, e.g. "SomeIndexer"
     std::string raw;                  // fallback (full description) if nothing parsed
 };
 
@@ -633,7 +833,7 @@ inline std::string trimCollapse(std::string s) {
     return s.substr(a, b - a + 1);
 }
 
-// Pull the AUDIO language list out of the description. Your AIOStreams renders
+// Pull the AUDIO language list out of the description. Some addons render
 // audio languages right after a globe icon (🌐) and subtitle languages after a
 // memo icon (📝); we read the codes between the two. Tolerant of a few icon
 // variants and returns empty (rather than guessing) if no marker is found.
@@ -654,7 +854,7 @@ inline std::vector<std::string> extractAudioLangs(const std::string& desc) {
     size_t from = start + markLen;
     // Language codes are plain ASCII; the NEXT non-ASCII byte begins the next
     // section (subtitles, source, etc.). Stopping there keeps the source name
-    // (e.g. "The Pirate Bay") from leaking in as bogus codes.
+    // (e.g. "SomeIndexer") from leaking in as bogus codes.
     size_t end = desc.size();
     for (size_t i = from; i < desc.size(); ++i) {
         if ((unsigned char)desc[i] >= 0x80) {
@@ -676,8 +876,8 @@ inline std::vector<std::string> extractAudioLangs(const std::string& desc) {
     return out;
 }
 
-// Tracker/indexer name, rendered right after a magnifier icon (🔍) by your
-// AIOStreams (e.g. "🔍 The Pirate Bay"). Reads the ASCII run up to the next icon.
+// Tracker/indexer name, rendered right after a magnifier icon (🔍) by some
+// addons (e.g. "🔍 SomeIndexer"). Reads the ASCII run up to the next icon.
 inline std::string extractSource(const std::string& desc) {
     size_t p = desc.find("\xF0\x9F\x94\x8D");  // 🔍
     if (p == std::string::npos) return std::string();
@@ -731,6 +931,10 @@ inline StreamInfo parseStream(const Stream& s) {
     addTo(info.meta, reFirst(blob, "(WEB-?DL|WEB-?Rip|BluRay|BDRip|BRRip|HDRip|HDTV|REMUX|DVDRip|CAM)"));
     addTo(info.meta, reFirst(blob, "(HEVC|AVC|x265|x264|H\\.?265|H\\.?264|AV1)"));
     addTo(info.meta, reFirst(blob, "([0-9]+(?:\\.[0-9]+)?\\s?(?:GB|MB))"));
+    // Seeders are torrent peers, not viewers. Addons expose this only when
+    // their formatter includes it (addons commonly use the people icon).
+    std::string seeders = reFirst(blob, "(?:seeders?\\s*[:=-]?\\s*|\\xF0\\x9F\\x91\\xA5\\s*)([0-9][0-9,]*)");
+    if (!seeders.empty()) addTo(info.meta, seeders + " seeders");
     std::string dur = reFirst(blob, "([0-9]+\\s?h[:\\s]?[0-9]+\\s?m(?:[:\\s]?[0-9]+\\s?s)?)");
     if (!dur.empty()) {
         dur = std::regex_replace(dur, std::regex("[:\\s]?[0-9]+\\s?s\\s*$"), "");

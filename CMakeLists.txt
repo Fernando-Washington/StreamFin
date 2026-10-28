@@ -25,6 +25,27 @@ if (MPV_SW_RENDER)
     list(APPEND APP_PLATFORM_OPTION -DMPV_SW_RENDER)
 endif ()
 
+# Dev-only accumulating error log (app/src/utils/debug_log.cpp), mirrored to
+# a plain-text file on the SD card so real-hardware bugs can be diagnosed
+# from the log instead of a verbal description. MUST be OFF before any
+# public release build.
+option(STREAMFIN_DEBUG_LOG "Enable persistent on-device error log (dev builds only)" OFF)
+if (STREAMFIN_DEBUG_LOG)
+    list(APPEND APP_PLATFORM_OPTION -DSTREAMFIN_DEBUG_LOG)
+endif ()
+
+# This is a personal Stremio client, not the original Switchfin/Jellyfin app --
+# there's no reason to phone device id/OS/git-commit data home to Google
+# Analytics (app/src/api/analytics.cpp) on every launch. NO_GA turns every
+# GA(...) call site into a no-op, so analytics::Analytics is never even
+# constructed and its background ticker never starts. This also happens to be
+# the source of a recurring "report failed: SSL connect error" warning on the
+# Switch: its own POST call used a 3s timeout, far too tight for some of the
+# console's slower TLS handshakes (the same class of problem the 45s timeouts
+# elsewhere were raised for) -- easier to just remove the telemetry than tune
+# yet another timeout for a feature nobody wants.
+list(APPEND APP_PLATFORM_OPTION -DNO_GA)
+
 if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build, options are: Debug Release RelWithDebInfo MinSizeRel." FORCE)
 elseif (CMAKE_BUILD_TYPE STREQUAL Debug)
@@ -149,10 +170,8 @@ if (PLATFORM_DESKTOP)
     find_package(MPV REQUIRED)
     list(APPEND APP_PLATFORM_INCLUDE ${MPV_INCLUDE_DIR})
     list(APPEND APP_PLATFORM_LIB ${MPV_LIBRARY})
-    if (NOT WIN32)
-        find_library(AVFORMAT_LIB NAMES avformat REQUIRED)
-        list(APPEND APP_PLATFORM_LIB ${AVFORMAT_LIB})
-    endif ()
+    find_library(AVFORMAT_LIB NAMES avformat REQUIRED)
+    list(APPEND APP_PLATFORM_LIB ${AVFORMAT_LIB})
 
     find_package(WebP)
     if (WebP_FOUND)

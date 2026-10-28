@@ -25,7 +25,11 @@ public:
 
     void dismiss(std::function<void(void)> cb = [] {}) override;
 
-    static void play(const std::string& path, const std::string& name = "");
+    // `streamId` is a Stremio id ("ttID:season:episode" for a series episode,
+    // "ttID" for a movie), used to enable per-season intro-skip markers
+    // (RemotePlayer parses seriesId/season out of it). Leave empty for
+    // anything that isn't Stremio-tracked content.
+    static void play(const std::string& path, const std::string& name = "", const std::string& streamId = "");
 
 protected:
     void setContent(RecyclingGrid* view);

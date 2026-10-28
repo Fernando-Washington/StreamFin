@@ -3,7 +3,7 @@
 
     A Stremio-style landing screen: a Favourites row (top) plus a vertical scroll
     of horizontal poster carousels filled from Cinemeta catalogs. Selecting a
-    poster fetches streams from AIOStreams; X toggles favourite.
+    poster fetches streams from the stream addons; X toggles favourite.
 */
 #pragma once
 
@@ -11,6 +11,7 @@
 
 class RecyclingGrid;
 class HRecyclerFrame;
+class SearchHeader;
 
 class StremioHome : public brls::Box {
 public:
@@ -34,8 +35,11 @@ private:
     brls::Label* continueHeader = nullptr;  // "Continue Watching" title (hidden when empty)
     HRecyclerFrame* continueRec = nullptr;  // continue-watching carousel
     HRecyclerFrame* firstRowRec = nullptr;  // first catalog row; safe focus parking spot
+    SearchHeader* searchHeader = nullptr;   // collapsible search bar pinned above the scroll
+    float lastScrollOffsetY = 0.0f;         // previous frame's scroll offset, to derive direction
     std::vector<brls::View*> catalogViews;      // headers + carousels of the catalog rows
     brls::Event<>::Subscription catalogsSub;    // CATALOGS_CHANGED subscription (always set in ctor)
+    brls::Event<>::Subscription scrollSub;      // drives the search header's collapse/expand
     bool pendingRebuild = false;            // registry changed while home was covered
     bool pendingFavRefresh = false;         // favourites changed while home was covered
     bool pendingContinueRefresh = false;    // continue-watching changed while home was covered

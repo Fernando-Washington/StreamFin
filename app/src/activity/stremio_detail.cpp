@@ -11,6 +11,7 @@
 #include "activity/stremio_favourites.hpp"
 #include "activity/stremio_resume.hpp"
 #include "utils/image.hpp"
+#include "utils/theme.hpp"
 #include "api/stremio.hpp"
 
 #include <set>
@@ -19,11 +20,16 @@ using namespace brls::literals;
 
 namespace {
 
-// Soft palette shared with the rest of the app.
-const NVGcolor COL_BG     = nvgRGB(16, 18, 24);    // cinematic slate
-const NVGcolor COL_TEXT   = nvgRGB(240, 242, 248); // soft white
-const NVGcolor COL_DIM    = nvgRGB(168, 176, 192); // secondary text
-const NVGcolor COL_ACCENT = nvgRGB(245, 33, 42);   // StreamFin brand red (meta line)
+// Palette shared with the rest of the app -- see utils/theme.hpp. Kept as
+// local aliases since this file uses these names dozens of times below.
+const NVGcolor& COL_BG = theme::BG_SCREEN;
+const NVGcolor& COL_TEXT = theme::TEXT_PRIMARY;
+const NVGcolor& COL_DIM = theme::TEXT_SECONDARY;
+const NVGcolor& COL_ACCENT = theme::ACCENT;
+
+// Fixed width for the Watch/Download pills -- wide enough to fit "Download"
+// (the longest label) comfortably with its padding.
+constexpr float BUTTON_WIDTH = 260.0f;
 
 // Join a string list: {"A","B"} -> "A, B".
 std::string join(const std::vector<std::string>& v, const char* sep = ", ") {
@@ -101,10 +107,16 @@ StremioDetail::StremioDetail(const stremio::Meta& item) : item(item) {
     this->btnWatch = new brls::Box();
     this->btnWatch->setFocusable(true);
     this->btnWatch->setAxis(brls::Axis::ROW);
+    this->btnWatch->setJustifyContent(brls::JustifyContent::CENTER);
     this->btnWatch->setPadding(14, 40, 14, 40);
+    // Fixed width so Watch and Download always match exactly -- padding
+    // alone doesn't do it since "Download" is longer than "Watch"/"Episodes"
+    // and each box was sizing to fit its own label.
+    this->btnWatch->setWidth(BUTTON_WIDTH);
     this->btnWatch->setCornerRadius(8);
     this->btnWatch->setBackgroundColor(COL_ACCENT);  // brand red
     auto* btnLabel = new brls::Label();
+    this->labelWatchButton = btnLabel;
     // ▶ is in the Switch system font; ☰ is not (renders as a crossed box).
     btnLabel->setText(item.type == "series" ? "▶  Episodes" : "▶  Watch");
     btnLabel->setFontSize(24);
@@ -116,6 +128,42 @@ StremioDetail::StremioDetail(const stremio::Meta& item) : item(item) {
     });
     this->btnWatch->addGestureRecognizer(new brls::TapGestureRecognizer(this->btnWatch));
     btnRow->addView(this->btnWatch);
+
+    // Explicit, visible "Download" action right below Watch -- movies only
+    // for now (a series downloads per-episode, from inside Episodes). This
+    // used to be a hidden X shortcut inside the stream picker, which nobody
+    // could reasonably discover on their own.
+    if (item.type != "series") {
+        // Wrapped in its own row, same as Watch above -- a Box added directly
+        // to `info` (COLUMN, default stretch) fills the whole column width
+        // instead of sizing to its own content, which is what made this
+        // button balloon out edge-to-edge.
+        auto* dlRow = new brls::Box();
+        dlRow->setAxis(brls::Axis::ROW);
+        dlRow->setMarginTop(12);
+        info->addView(dlRow);
+
+        this->btnDownload = new brls::Box();
+        this->btnDownload->setFocusable(true);
+        this->btnDownload->setAxis(brls::Axis::ROW);
+        this->btnDownload->setJustifyContent(brls::JustifyContent::CENTER);
+        this->btnDownload->setPadding(14, 40, 14, 40);
+        this->btnDownload->setWidth(BUTTON_WIDTH);
+        this->btnDownload->setCornerRadius(8);
+        this->btnDownload->setBackgroundColor(theme::BG_BUTTON);
+        auto* dlLabel = new brls::Label();
+        this->labelDownloadButton = dlLabel;
+        dlLabel->setText("⬇  Download");
+        dlLabel->setFontSize(24);
+        dlLabel->setTextColor(COL_TEXT);
+        this->btnDownload->addView(dlLabel);
+        this->btnDownload->registerClickAction([this](brls::View*) {
+            this->openStreams(true);
+            return true;
+        });
+        this->btnDownload->addGestureRecognizer(new brls::TapGestureRecognizer(this->btnDownload));
+        dlRow->addView(this->btnDownload);
+    }
 
     this->labelDesc = new brls::Label();
     this->labelDesc->setText("Loading…");
@@ -171,8 +219,9 @@ StremioDetail::StremioDetail(const stremio::Meta& item) : item(item) {
             ASYNC_RELEASE
             this->applyMeta(r.meta);
         },
-        [ASYNC_TOKEN](const std::string&) {
+        [ASYNC_TOKEN, id = item.id](const std::string& err) {
             ASYNC_RELEASE
+            brls::Logger::warning("meta fetch failed for {}: {}", id, err);
             this->labelDesc->setText("No details available.");
         },
         stremio::CINEMETA + "/meta/" + item.type + "/" + item.id + ".json");
@@ -245,32 +294,49 @@ void StremioDetail::onAction() {
     this->openStreams();
 }
 
-void StremioDetail::openStreams() {
+void StremioDetail::openStreams(bool downloadMode) {
     if (this->fetching) return;  // ignore repeat presses while a request runs
     if (stremio::STREAM_ADDONS.empty()) {
         brls::Application::notify("Set your stream addon first (press − on the home screen)");
         return;
     }
-    this->fetching = true;
-    brls::Application::notify("Finding streams…");
+    this->setFetching(true);
 
     std::string name = this->item.name;
     ResumeEntry key{this->item.type, this->item.id, this->item.name, this->item.poster};
 
+    auto picker = std::make_shared<StreamPickerHandle>();
     ASYNC_RETAIN
     stremio::getStreams(this->item.type, this->item.id,
-        [ASYNC_TOKEN, name, key](std::vector<stremio::Stream> streams) {
-            ASYNC_RELEASE
-            this->fetching = false;
-            if (streams.empty()) {
-                brls::Application::notify("No streams found");
-                return;
+        [ASYNC_TOKEN, picker, name, key, downloadMode](std::vector<stremio::Stream> streams, size_t pending) {
+            if (*token) return;
+            if (!picker->opened()) {
+                this->setFetching(false);
+                auto* view = new StreamPicker(name, streams, key, downloadMode, {}, {}, pending);
+                picker->attach(view);
+                brls::Application::pushActivity(new brls::Activity(view));
+            } else {
+                picker->append(std::move(streams), pending);
             }
-            brls::Application::pushActivity(new brls::Activity(new StreamPicker(name, streams, key)));
+        },
+        [ASYNC_TOKEN, picker]() {
+            picker->finish();
+            ASYNC_RELEASE
+            this->setFetching(false);
         },
         [ASYNC_TOKEN](const std::string& e) {
-            ASYNC_RELEASE
-            this->fetching = false;
+            if (*token) return;
             brls::Application::notify("Stream error: " + e);
         });
+}
+
+void StremioDetail::setFetching(bool fetching) {
+    this->fetching = fetching;
+    this->labelWatchButton->setText(fetching ? "Loading streams..."
+        : (this->item.type == "series" ? "▶  Episodes" : "▶  Watch"));
+    if (this->labelDownloadButton)
+        this->labelDownloadButton->setText(fetching ? "Loading streams..." : "⬇  Download");
+    this->btnWatch->setBackgroundColor(fetching ? theme::BG_DISABLED : COL_ACCENT);
+    if (this->btnDownload)
+        this->btnDownload->setBackgroundColor(fetching ? theme::BG_DISABLED : theme::BG_BUTTON);
 }

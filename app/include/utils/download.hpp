@@ -9,7 +9,6 @@
 #include <vector>
 
 enum class DownloadStatus { Queued, Downloading, Completed, Failed, NotFound };
-enum class DownloadQuality { Original, Q1080p, Q720p, Q480p };
 
 NLOHMANN_JSON_SERIALIZE_ENUM(DownloadStatus, {
     {DownloadStatus::Queued, "Queued"},
@@ -18,53 +17,69 @@ NLOHMANN_JSON_SERIALIZE_ENUM(DownloadStatus, {
     {DownloadStatus::Failed, "Failed"},
 })
 
-NLOHMANN_JSON_SERIALIZE_ENUM(DownloadQuality, {
-    {DownloadQuality::Original, "Original"},
-    {DownloadQuality::Q1080p, "1080p"},
-    {DownloadQuality::Q720p, "720p"},
-    {DownloadQuality::Q480p, "480p"},
-})
-
+// One saved-for-offline movie or episode. `id` is the same streamId shape
+// ResumeEntry already uses ("tt1234567" for a movie, "tt1234567:1:2" for
+// S1E2), so a download and its Continue Watching entry line up naturally.
 struct DownloadItem {
-    std::string itemId;
-    std::string name;
-    std::string type;
-    std::string seriesId;
+    std::string id;
+    std::string name;          // display title, e.g. "Series · S1E5 · Episode"
+    std::string streamType;    // "movie" | "series"
+    std::string seriesId;      // parent series id; empty for movies -- used to group episodes
     std::string seriesName;
     int seasonIndex = 0;
     int episodeIndex = 0;
-    long productionYear = 0;
-    uint64_t runTimeTicks = 0;
-    std::string imagePrimaryTag;
-    DownloadQuality quality = DownloadQuality::Original;
+    std::string poster;        // poster URL, fetched once and cached alongside the file
+    std::string qualityLabel;  // display-only, e.g. "Knaben · 1080p" (from stremio::parseStream)
+    std::string sourceUrl;     // the stream URL to fetch -- caller already picked/resolved this
     DownloadStatus status = DownloadStatus::Queued;
-    std::string filePath;
-    int64_t totalBytes = 0;
+    std::string filePath;      // filename on disk inside its own item directory, e.g. "video.mp4"
+    int64_t totalBytes = 0;      // filled in by the caller from a HEAD request before queuing
     int64_t downloadedBytes = 0;
     std::string errorMessage;
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(DownloadItem, itemId, name, type, seriesId, seriesName,
-    seasonIndex, episodeIndex, productionYear, runTimeTicks, imagePrimaryTag, quality, status,
-    filePath, totalBytes, downloadedBytes, errorMessage);
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(DownloadItem, id, name, streamType, seriesId, seriesName,
+    seasonIndex, episodeIndex, poster, qualityLabel, sourceUrl, status, filePath, totalBytes, downloadedBytes,
+    errorMessage);
+
+// Blocking HEAD-style request for a URL's Content-Length. Returns -1 if the
+// server doesn't report a size or the request fails -- callers should treat
+// that as "size unknown", not zero.
+int64_t remoteContentLength(const std::string& url);
+
+// Bytes free on the SD card, where downloads live (same volume as
+// AppConfig::configDir()). Returns -1 on error.
+int64_t downloadDiskFreeBytes();
+
+// Total capacity of that same SD card. Returns -1 on error.
+int64_t downloadDiskTotalBytes();
 
 class DownloadManager : public brls::Singleton<DownloadManager> {
 public:
-    using ProgressEvent = brls::Event<std::string, int64_t, int64_t>;
-    using StatusEvent = brls::Event<std::string, DownloadStatus>;
+    using ProgressEvent = brls::Event<std::string, int64_t, int64_t>;  // id, downloadedBytes, totalBytes
+    using StatusEvent = brls::Event<std::string, DownloadStatus>;      // id, new status
 
     void init();
 
-    void addDownload(const std::string& itemId, DownloadQuality quality);
-    void cancelDownload(const std::string& itemId);
-    void removeDownload(const std::string& itemId);
+    // `item` must already have id/name/sourceUrl/totalBytes populated -- the
+    // caller does the size check (remoteContentLength) and any user
+    // confirmation before calling this. A no-op if `item.id` is already queued
+    // or downloaded.
+    void addDownload(const DownloadItem& item);
+    void cancelDownload(const std::string& id);
+    void removeDownload(const std::string& id);
     void resumeQueue();
 
-    DownloadStatus findItem(const std::string& itemId) const;
+    DownloadStatus findItem(const std::string& id) const;
+    // {total episodes downloaded-or-queued, completed} for a series, used for
+    // a season's download-progress badge.
     std::pair<size_t, size_t> findSeries(const std::string& seriesId) const;
-    std::string getLocalPath(const std::string& itemId) const;
+    std::string getLocalPath(const std::string& id) const;  // "" unless Completed
 
     std::vector<DownloadItem> getItems() const;
     std::string downloadDir() const;
+    // Sum of on-disk bytes for completed downloads -- what the app itself is
+    // using on the SD card, as opposed to everything else on it.
+    int64_t totalOwnBytes() const;
 
     ProgressEvent* getProgressEvent() { return &progressEvent; }
     StatusEvent* getStatusEvent() { return &statusEvent; }
@@ -74,7 +89,6 @@ private:
     void loadIndex();
     void processQueue();
     void doDownload(DownloadItem& item);
-    std::string buildDownloadUrl(const DownloadItem& item) const;
 
     mutable std::mutex mutex;
     std::vector<DownloadItem> items;

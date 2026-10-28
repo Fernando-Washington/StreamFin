@@ -21,7 +21,8 @@ public:
 private:
     void applyMeta(const stremio::MetaDetail& meta);
     void onAction();      // Watch (movie) / Episodes (series)
-    void openStreams();
+    void openStreams(bool downloadMode = false);
+    void setFetching(bool fetching);
 
     stremio::Meta item;   // catalog entry we were opened with
     std::vector<stremio::Video> videos;  // series episodes from the meta fetch
@@ -37,4 +38,7 @@ private:
     brls::Label* labelCast = nullptr;
     brls::Label* labelDirector = nullptr;
     brls::Box* btnWatch = nullptr;
+    brls::Box* btnDownload = nullptr;  // movies only; series downloads happen per-episode
+    brls::Label* labelWatchButton = nullptr;
+    brls::Label* labelDownloadButton = nullptr;
 };

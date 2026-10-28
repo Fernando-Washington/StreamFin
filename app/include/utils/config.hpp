@@ -108,6 +108,10 @@ public:
         HTTP_PROXY,
 
         DOWNLOAD_QUALITY,
+        SEASON_DOWNLOAD_AUTO,
+        AUTOPLAY_NEXT_EPISODE,
+        AUDIO_LANG_PREF,     // mpv "alang" value, e.g. "eng,en" -- preferred audio track language
+        SMART_DOWNLOADS,     // auto-delete watched episodes, auto-queue the next one (opt-in)
 
         KEY_REFRESH,        // 刷新快捷键
         KEY_LAST,           // 上一个Tab快捷键

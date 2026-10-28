@@ -17,8 +17,11 @@
 #include "view/h_recycling.hpp"
 #include "view/video_card.hpp"
 #include "view/svg_image.hpp"
+#include "view/sidebar_menu.hpp"
+#include "view/search_header.hpp"
 #include "utils/image.hpp"
 #include "utils/config.hpp"
+#include "utils/theme.hpp"
 #include "api/stremio.hpp"
 
 #include <ctime>
@@ -54,7 +57,7 @@ void styleRowHeader(brls::Label* h, const std::string& text) {
     h->setMarginTop(28);
     h->setMarginBottom(12);
     h->setMarginLeft(6);
-    h->setTextColor(nvgRGB(240, 242, 248));  // soft white for clear hierarchy
+    h->setTextColor(theme::TEXT_PRIMARY);
 }
 
 // Data source: turns a list of Cinemeta metas into poster cards. Selecting a
@@ -100,6 +103,12 @@ public:
         std::string poster = stremio::posterUrl(item.id, item.poster);
         if (!poster.empty()) Image::with(cell->picture, poster);
 
+        // Marks whichever card is currently bound to index 0, so the single
+        // NAV_LEFT action in StremioHome's ctor knows when to open the
+        // sidebar. Set on every bind (not just index 0) so a recycled cell
+        // that moves off index 0 doesn't keep a stale marker.
+        cell->setId(index == 0 ? HOME_ROW_FIRST_CARD_ID : "home/row-card");
+
         return cell;
     }
 
@@ -121,6 +130,7 @@ private:
 class ContinueSource : public RecyclingGridDataSource {
 public:
     explicit ContinueSource(const std::vector<ResumeEntry>& r) : list(r) {}
+    ~ContinueSource() override { *this->alive = false; }
 
     size_t getItemCount() override { return this->list.size(); }
 
@@ -154,6 +164,9 @@ public:
         std::string poster = stremio::posterUrl(e.streamId, e.poster);
         if (!poster.empty()) Image::with(cell->picture, poster);
 
+        // See StremioSource::cellForRow for why this is set unconditionally.
+        cell->setId(index == 0 ? HOME_ROW_FIRST_CARD_ID : "home/row-card");
+
         return cell;
     }
 
@@ -164,32 +177,48 @@ public:
             return;
         }
         brls::Application::notify("Finding streams…");
+        auto alive = this->alive;
+        auto stack = brls::Application::getActivitiesStack();
+        auto* origin = stack.empty() ? nullptr : stack.back();
+        auto picker = std::make_shared<StreamPickerHandle>();
         stremio::getStreams(e.streamType, e.streamId,
-            [e](std::vector<stremio::Stream> streams) {
-                if (streams.empty()) {
-                    brls::Application::notify("No streams found");
-                    return;
+            [e, alive, origin, picker](std::vector<stremio::Stream> streams, size_t pending) {
+                if (!*alive) return;
+                if (!picker->opened()) {
+                    auto stack = brls::Application::getActivitiesStack();
+                    if (stack.empty() || stack.back() != origin) return;
+                    auto* view = new StreamPicker(e.name, streams, e, false, {}, {}, pending);
+                    picker->attach(view);
+                    brls::Application::pushActivity(new brls::Activity(view));
+                } else {
+                    picker->append(std::move(streams), pending);
                 }
-                brls::Application::pushActivity(new brls::Activity(new StreamPicker(e.name, streams, e)));
             },
-            [](const std::string& err) { brls::Application::notify("Stream error: " + err); });
+            [picker]() { picker->finish(); },
+            [alive](const std::string& err) {
+                if (*alive) brls::Application::notify("Stream error: " + err);
+            });
     }
 
     void clearData() override { this->list.clear(); }
 
 private:
     std::vector<ResumeEntry> list;
+    std::shared_ptr<bool> alive = std::make_shared<bool>(true);
 };
 
 }  // namespace
 
-StremioHome::~StremioHome() { stremio::CATALOGS_CHANGED.unsubscribe(this->catalogsSub); }
+StremioHome::~StremioHome() {
+    stremio::CATALOGS_CHANGED.unsubscribe(this->catalogsSub);
+    brls::Application::getRunLoopEvent()->unsubscribe(this->scrollSub);
+}
 
 StremioHome::StremioHome() {
     brls::Logger::debug("StremioHome: create");
     this->setAxis(brls::Axis::COLUMN);
     this->setDimensions(brls::Application::contentWidth, brls::Application::contentHeight);
-    this->setBackgroundColor(nvgRGB(16, 18, 24));  // deep cinematic slate
+    this->setBackgroundColor(theme::BG_SCREEN);
 
     auto* scroll = new brls::ScrollingFrame();
     scroll->setGrow(1.0f);
@@ -205,7 +234,54 @@ StremioHome::StremioHome() {
     this->boxHome->setPadding(16, 50, 32, 50);  // more breathing room at the edges
     scroll->setContentView(this->boxHome);
 
+    // Search bar pinned above the scroll (not inside it, so it can collapse
+    // independently of the carousels). Selecting it opens the keyboard;
+    // submitting a query pushes the existing search results screen. Wrapped
+    // in a full-width row so the (deliberately narrow) pill centers itself
+    // instead of stretching edge to edge.
+    this->searchHeader = new SearchHeader();
+    this->searchHeader->onSearch = [](const std::string& query) {
+        brls::Application::pushActivity(new brls::Activity(new StremioSearch(query)));
+    };
+    auto* searchWrap = new brls::Box();
+    searchWrap->setAxis(brls::Axis::ROW);
+    searchWrap->setJustifyContent(brls::JustifyContent::CENTER);
+    searchWrap->setPadding(20, 50, 0, 50);  // matches boxHome's left/right so it lines up with the carousels
+    searchWrap->setMarginBottom(20);
+    searchWrap->addView(this->searchHeader);
+    this->addView(searchWrap);
+
     this->addView(scroll);
+    // Drawer overlay, parked off-screen left; slides in when focus reaches it
+    // (see SidebarMenu / the LEFT route set on every row's first card).
+    this->addView(new SidebarMenu());
+
+    // Collapse the search header the moment the page scrolls down at all.
+    // ScrollingFrame has no scroll event, so this samples its (already
+    // smoothed) offset once a frame instead.
+    this->scrollSub = brls::Application::getRunLoopEvent()->subscribe([this, scroll]() {
+        float y = scroll->getContentOffsetY();
+        float delta = y - this->lastScrollOffsetY;
+        this->lastScrollOffsetY = y;
+        if (delta > 0.5f) this->searchHeader->setCollapsed(true);
+    });
+
+    // Reopening it is edge-triggered, same rule as the sidebar menu: a
+    // single fresh Up press (not held/repeating) while already on the home
+    // page's first row -- checked via scroll offset, since "first row" can
+    // be Continue Watching, Favourites, or the first catalog row depending
+    // on what's visible, but all three sit at offset 0 when focused. Holding
+    // Up through several rows toward the top must NOT pop this open; only a
+    // deliberate extra press once there should.
+    this->registerAction(
+        "", brls::BUTTON_NAV_UP,
+        [this, scroll](brls::View*) {
+            if (scroll->getContentOffsetY() > 0.5f) return false;
+            this->searchHeader->setCollapsed(false);
+            brls::Application::giveFocus(this->searchHeader);
+            return true;
+        },
+        /*hidden*/ true);
 
     // Continue Watching (very top) + Favourites rows — both hidden until non-empty.
     Favourites::instance().load();
@@ -244,6 +320,26 @@ StremioHome::StremioHome() {
         brls::Application::pushActivity(new brls::Activity(new StremioCatalogs()));
         return true;
     });
+
+    // Open the sidebar menu on a genuine, single Left press while resting on
+    // a row's first card. Registered once here (not per-cell) and with
+    // allowRepeating left at its default (false), so this is skipped
+    // entirely while the direction is held/auto-repeating -- holding Left
+    // through the middle of a row must NOT fling you into the drawer, only
+    // a fresh press from card 0 should. Returning false for every other
+    // case lets the normal within-row navigation run unmodified.
+    this->registerAction(
+        "", brls::BUTTON_NAV_LEFT,
+        [](brls::View*) {
+            brls::View* focus = brls::Application::getCurrentFocus();
+            if (!focus || focus->getId() != HOME_ROW_FIRST_CARD_ID) return false;
+            brls::View* target = focus->getNearestView(SIDEBAR_MENU_FIRST_ITEM_ID);
+            if (!target) return false;
+            brls::Application::giveFocus(target);
+            return true;
+        },
+        /*hidden*/ true);
+
     if (stremio::STREAM_ADDONS.empty())
         brls::sync([]() { promptForAddon(""); });
 }
@@ -260,7 +356,10 @@ void StremioHome::addRow(const std::string& title, const std::string& url) {
     this->boxHome->addView(rec);
     this->catalogViews.push_back(header);
     this->catalogViews.push_back(rec);
-    if (!this->firstRowRec) this->firstRowRec = rec;  // safe parking spot for focus
+    if (!this->firstRowRec) {
+        this->firstRowRec = rec;  // safe parking spot for focus
+        rec->setId(SIDEBAR_MENU_RETURN_ID);  // also where the sidebar menu sends focus back
+    }
     rec->showSkeleton(8);
 
     ASYNC_RETAIN
@@ -289,7 +388,10 @@ void StremioHome::addRow(const std::string& title, const std::string& url) {
                     brls::Application::giveFocus(rec);
             });
         },
-        [ASYNC_TOKEN, rec](const std::string&) { ASYNC_RELEASE },
+        [ASYNC_TOKEN, rec, url](const std::string& e) {
+            ASYNC_RELEASE
+            brls::Logger::warning("catalog row fetch failed for {}: {}", url, e);
+        },
         url);
 }
 

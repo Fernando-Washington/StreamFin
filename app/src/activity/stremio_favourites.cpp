@@ -30,7 +30,11 @@ void Favourites::load() {
 
 void Favourites::save() {
     std::string dir = AppConfig::instance().configDir();
+#ifdef _WIN32
+    ::mkdir(dir.c_str());
+#else
     ::mkdir(dir.c_str(), 0777);
+#endif
     try {
         std::ofstream out(dir + "/favourites.json");
         if (out.is_open()) {

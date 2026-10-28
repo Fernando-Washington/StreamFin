@@ -13,7 +13,7 @@ class Event;
 const size_t REPORT_MAX_NUM = 25;
 
 #ifdef NO_GA
-#define GA(a) void(a);
+#define GA(a, ...) void(a);
 #else
 #define GA(a, ...) analytics::Analytics::instance().report(a, ##__VA_ARGS__);
 #endif /* NO_GA */

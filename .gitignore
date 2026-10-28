@@ -1,4 +1,5 @@
 build*/
+/.maestri/
 /.idea/
 /cmake-*/
 /.xmake/

@@ -122,10 +122,9 @@ ContextMenu::ContextMenu(const jellyfin::Item& item, BaseCardCell* view) : itemI
                 brls::Application::notify("main/download/downloading"_i18n);
                 break;
             default:
-                int qi = AppConfig::instance().getValueIndex(AppConfig::DOWNLOAD_QUALITY);
-                dm.addDownload(this->itemId, static_cast<DownloadQuality>(qi));
+                // Jellyfin-style transcoded downloads aren't offered anymore --
+                // downloads now go through the Stremio stream picker instead.
                 brls::Application::notify("main/download/queued"_i18n);
-                this->btnDownload->setSelected(true);
             }
             return true;
         });

@@ -88,26 +88,21 @@ public:
     void setItem(const DownloadItem& item, const std::string& downloadDir) {
         auto theme = brls::Application::getTheme();
 
-        std::string thumbPath = downloadDir + "/" + item.itemId + "/thumb.png";
+        std::string thumbPath = downloadDir + "/" + item.id + "/thumb.jpg";
         if (fs::exists(thumbPath)) {
             this->thumb->setImageFromFile(thumbPath);
-        } else {
-            Image::load(this->thumb, jellyfin::apiPrimaryImage, item.itemId,
-                HTTP::encode_form({{"tag", item.imagePrimaryTag}, {"maxWidth", "300"}}));
+        } else if (!item.poster.empty()) {
+            Image::with(this->thumb, item.poster);
         }
 
-        // title = episode or movie name; subtitle = "Show · SxEy" or year,
-        // completed with the duration
+        // title = episode or movie name; subtitle = "Show · SxEy" or the
+        // stream's quality label
         this->name->setText(item.name);
         std::string detail;
         if (!item.seriesName.empty()) {
             detail = fmt::format("{} · S{}E{}", item.seriesName, item.seasonIndex, item.episodeIndex);
-        } else if (item.productionYear > 0) {
-            detail = std::to_string(item.productionYear);
-        }
-        if (item.runTimeTicks > 0) {
-            if (!detail.empty()) detail += " · ";
-            detail += misc::sec2Time(item.runTimeTicks / jellyfin::PLAYTICKS);
+        } else if (!item.qualityLabel.empty()) {
+            detail = item.qualityLabel;
         }
         this->detail->setText(detail);
 
@@ -199,7 +194,7 @@ public:
             if (it.status == DownloadStatus::Completed && it.totalBytes <= 0 && !it.filePath.empty()) {
                 // inherited index without Content-Length: real file size
                 try {
-                    it.totalBytes = (int64_t)fs::file_size(this->dlDir + "/" + it.itemId + "/" + it.filePath);
+                    it.totalBytes = (int64_t)fs::file_size(this->dlDir + "/" + it.id + "/" + it.filePath);
                 } catch (const std::exception&) {
                 }
             }
@@ -233,26 +228,24 @@ public:
         auto& dm = DownloadManager::instance();
 
         if (item.status == DownloadStatus::Completed) {
-            std::string path = dm.getLocalPath(item.itemId);
+            std::string path = dm.getLocalPath(item.id);
             if (path.empty()) return;
 
             std::string detail;
             if (!item.seriesName.empty()) {
                 detail = fmt::format("{} - S{}E{}", item.seriesName, item.seasonIndex, item.episodeIndex);
-            } else if (item.productionYear > 0) {
-                detail = fmt::format("{} ({})", item.name, item.productionYear);
             } else {
                 detail = item.name;
             }
             RemoteView::play(path, detail);
         } else if (item.status == DownloadStatus::Downloading) {
-            std::string id = item.itemId;
+            std::string id = item.id;
             Dialog::cancelable(
                 "main/download/confirm_cancel"_i18n, [id]() { DownloadManager::instance().cancelDownload(id); });
         } else if (item.status == DownloadStatus::Queued) {
             DownloadManager::instance().resumeQueue();
         } else if (item.status == DownloadStatus::Failed) {
-            std::string id = item.itemId;
+            std::string id = item.id;
             Dialog::cancelable(
                 "main/download/confirm_remove"_i18n, [id]() { DownloadManager::instance().removeDownload(id); });
         }
@@ -271,7 +264,7 @@ public:
     bool updateProgress(const std::string& itemId, int64_t downloaded, int64_t total, size_t& index) {
         for (size_t i = 0; i < this->rows.size(); i++) {
             auto& row = this->rows[i];
-            if (row.kind != Row::Kind::Item || row.item.itemId != itemId) continue;
+            if (row.kind != Row::Kind::Item || row.item.id != itemId) continue;
             if (row.item.status != DownloadStatus::Downloading) return false;
             row.item.downloadedBytes = downloaded;
             row.item.totalBytes = total;
@@ -324,7 +317,7 @@ DownloadView::DownloadView() {
         if (!ds) return false;
         const DownloadItem* item = ds->itemAt(focus->getIndex());
         if (!item) return false;
-        std::string id = item->itemId;
+        std::string id = item->id;
         Dialog::cancelable("main/download/confirm_remove"_i18n, [this, id]() {
             DownloadManager::instance().removeDownload(id);
             this->loadItems();
@@ -339,7 +332,7 @@ DownloadView::DownloadView() {
         auto items = DownloadManager::instance().getItems();
         if (items.empty()) return false;
         Dialog::cancelable("main/download/confirm_remove_all"_i18n, [this, items]() {
-            for (auto& it : items) DownloadManager::instance().removeDownload(it.itemId);
+            for (auto& it : items) DownloadManager::instance().removeDownload(it.id);
             this->loadItems();
             this->updateStorage();
         });
@@ -413,7 +406,7 @@ void DownloadView::updateStorage() {
                 appBytes += it.totalBytes;
             } else if (!it.filePath.empty()) {
                 try {
-                    appBytes += (int64_t)fs::file_size(dir + "/" + it.itemId + "/" + it.filePath);
+                    appBytes += (int64_t)fs::file_size(dir + "/" + it.id + "/" + it.filePath);
                 } catch (const std::exception&) {
                 }
             }

@@ -67,8 +67,8 @@ MediaMovie::MediaMovie(const jellyfin::Item& item) : itemId(item.Id) {
             brls::Application::notify("main/download/completed"_i18n);
             break;
         default:
-            int qi = AppConfig::instance().getValueIndex(AppConfig::DOWNLOAD_QUALITY);
-            dm.addDownload(this->itemId, static_cast<DownloadQuality>(qi));
+            // Jellyfin-style transcoded downloads aren't offered anymore --
+            // downloads now go through the Stremio stream picker instead.
             this->updateDownloadButton();
         }
         return true;

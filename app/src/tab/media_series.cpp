@@ -267,9 +267,8 @@ void MediaSeries::doDownloadSeries() {
             }
             Dialog::cancelable(
                 fmt::format(fmt::runtime("main/download/confirm_season"_i18n), wanted.size()), [wanted]() {
-                    auto& dm = DownloadManager::instance();
-                    int qi = AppConfig::instance().getValueIndex(AppConfig::DOWNLOAD_QUALITY);
-                    for (auto& key : wanted) dm.addDownload(key, static_cast<DownloadQuality>(qi));
+                    // Jellyfin-style transcoded downloads aren't offered anymore --
+                    // downloads now go through the Stremio stream picker instead.
                     brls::Application::notify("main/download/queued"_i18n);
                 });
         },

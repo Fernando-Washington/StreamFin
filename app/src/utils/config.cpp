@@ -37,6 +37,11 @@ constexpr uint32_t MINIMUM_WINDOW_WIDTH = 640;
 constexpr uint32_t MINIMUM_WINDOW_HEIGHT = 360;
 #endif
 
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <sys/stat.h>
+
 #include <borealis.hpp>
 #include <borealis/core/cache_helper.hpp>
 #include <borealis/views/edit_text_dialog.hpp>
@@ -131,6 +136,15 @@ std::unordered_map<AppConfig::Item, AppConfig::Option> AppConfig::settingMap = {
     {HTTP_PROXY, {"http_proxy"}},
 
     {DOWNLOAD_QUALITY, {"download_quality", {"Original", "1080p", "720p", "480p"}, {0, 1, 2, 3}}},
+    // Season downloads: auto-pick the best stream per episode, or ask every time.
+    {SEASON_DOWNLOAD_AUTO, {"season_download_auto"}},
+    // Play the next episode automatically (with a cancelable countdown) when one ends.
+    {AUTOPLAY_NEXT_EPISODE, {"autoplay_next_episode"}},
+    // Seconds of a leading "Skip intro" prompt shown at the start of an episode; 0 disables it.
+    // Preferred audio track language, passed straight to mpv's "alang".
+    {AUDIO_LANG_PREF, {"audio_lang_pref"}},
+    // Auto-delete a watched episode's download and auto-queue the next one.
+    {SMART_DOWNLOADS, {"smart_downloads"}},
 
     {KEY_REFRESH, {"key_refresh"}},
     {KEY_LAST, {"key_last"}},
@@ -224,7 +238,76 @@ static std::string generateDeviceId() {
     return misc::randHex(16);
 }
 
+#if __SWITCH__
+namespace {
+
+// Everything under the old sdmc:/config/StreamFin used to be the app's data
+// folder; it's now sdmc:/switch/streamfin (next to the .nro, easier to find
+// on the SD card). Existing installs shouldn't just lose their addon config,
+// favourites, resume history and -- most importantly -- already-downloaded
+// videos because of that move. Runs on every launch (cheap: a handful of
+// stat() calls once the old folder is empty) and is safe to run repeatedly --
+// once a file has been moved, its "already exists at the destination" check
+// makes every later run a no-op for it.
+bool isEmptyJsonArray(const std::string& path) {
+    std::ifstream in(path);
+    if (!in.is_open()) return true;  // missing counts as "nothing to protect"
+    try {
+        nlohmann::json j;
+        in >> j;
+        return j.is_array() && j.empty();
+    } catch (...) {
+        return true;
+    }
+}
+
+void migrateOldDataFolder(const std::string& newDir) {
+    const std::string oldDir = "sdmc:/config/StreamFin";
+    struct stat st {};
+    if (::stat(oldDir.c_str(), &st) != 0) return;  // nothing to migrate
+
+    auto migrateFile = [&](const std::string& name) {
+        std::string oldPath = oldDir + "/" + name;
+        std::string newPath = newDir + "/" + name;
+        struct stat s {};
+        if (::stat(oldPath.c_str(), &s) != 0) return;  // old doesn't have one
+        if (::stat(newPath.c_str(), &s) == 0) return;  // new already has one -- never clobber
+        if (std::rename(oldPath.c_str(), newPath.c_str()) == 0)
+            brls::Logger::info("Migrated {} from the old data folder", name);
+        else
+            brls::Logger::warning("Could not migrate {} from the old data folder: {}", name, strerror(errno));
+    };
+    // Not config.json: by the time this runs, the new folder's config.json
+    // (if any) already reflects settings picked in THIS build; the old one
+    // has nothing this build doesn't already ask for again on first use.
+    migrateFile("favourites.json");
+    migrateFile("resume.json");
+    migrateFile("stremio_addon.json");
+    migrateFile("addon.txt");
+
+    // Downloads get special handling: only take over the whole folder if the
+    // new one is still untouched (missing, or an empty index) -- never if
+    // the user already has real downloads sitting in the new location.
+    std::string oldDownloads = oldDir + "/downloads";
+    std::string newDownloads = newDir + "/downloads";
+    struct stat sOld {};
+    if (::stat(oldDownloads.c_str(), &sOld) == 0 && isEmptyJsonArray(newDownloads + "/index.json")) {
+        std::remove((newDownloads + "/index.json").c_str());
+        ::rmdir(newDownloads.c_str());
+        if (std::rename(oldDownloads.c_str(), newDownloads.c_str()) == 0)
+            brls::Logger::info("Migrated downloads/ from the old data folder");
+        else
+            brls::Logger::warning("Could not migrate downloads/ from the old data folder: {}", strerror(errno));
+    }
+}
+
+}  // namespace
+#endif
+
 bool AppConfig::init() {
+#if __SWITCH__
+    migrateOldDataFolder(this->configDir());
+#endif
     const std::string path = this->configDir() + "/config.json";
 #if !defined(USE_BOOST_FILESYSTEM) || defined(_WIN32)
     std::ifstream f(fs::u8path(path));
@@ -577,7 +660,11 @@ bool AppConfig::checkDanmuku() {
 
 std::string AppConfig::configDir() {
 #if __SWITCH__
-    return fmt::format("sdmc:/config/{}", AppVersion::getPackageName());
+    // Lives next to the .nro (sdmc:/switch/streamfin/StreamFin.nro) instead of
+    // the less discoverable sdmc:/config/ -- config.json, downloads/ and the
+    // dev-only debug.log all end up in one folder that's easy to find and
+    // pull files from on the SD card.
+    return "sdmc:/switch/streamfin";
 #elif defined(__PS4__)
     return fmt::format("/data/{}", AppVersion::getPackageName());
 #elif defined(__PSV__)

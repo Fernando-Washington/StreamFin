@@ -127,4 +127,8 @@ private:
     struct curl_slist* chunk;
     Cancel is_cancel;
     Progress event;
+    // CURLOPT_ERRORBUFFER target -- backends like NSS often collapse many
+    // distinct handshake failures into the same generic CURLcode, so this
+    // carries whatever extra text the backend is willing to give us.
+    char errorBuffer[256];
 };

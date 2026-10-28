@@ -6,6 +6,10 @@
 #include <webp/decode.h>
 #endif
 #include <stb_image.h>
+#include <chrono>
+#include <functional>
+#include <random>
+#include <thread>
 
 #ifdef BOREALIS_USE_GXM
 #ifndef MAX
@@ -147,7 +151,7 @@ void Image::with(brls::Image* view, const std::string& url, const std::string& f
     item->image = view;
     item->url = url;
     item->fallbackUrl = fallback;
-    item->isCancel->store(false);
+    item->isCancel = std::make_shared<std::atomic_bool>(false);
     view->ptrLock();
     // 设置图片组件不处理纹理的销毁，由缓存统一管理纹理销毁
     view->setFreeTexture(false);
@@ -163,97 +167,135 @@ void Image::cancel(brls::Image* view) {
 }
 
 void Image::doRequest(HTTP& s) {
-    if (this->isCancel->load()) {
-        Image::clear(this->image);
-        return;
-    }
-    try {
-        std::ostringstream body;
-        HTTP::set_option(s, this->isCancel, HTTP::Timeout{});
-        s._get(this->url, &body);
-        std::string data = body.str();
-        uint8_t* imageData = nullptr;
-        int imageW = 0, imageH = 0;
-        bool isWebp = false;
-#ifdef USE_WEBP
-        char* ct = nullptr;
-        if (url.find("Webp") != std::string::npos || (s.getinfo(&ct) && strcmp(ct, "image/webp") == 0)) {
-            imageData = WebPDecodeRGBA((const uint8_t*)data.c_str(), data.size(), &imageW, &imageH);
-            isWebp = true;
-        } else
-#endif
-        {
-            int n;
-            imageData = stbi_load_from_memory((unsigned char*)data.c_str(), data.size(), &imageW, &imageH, &n, 4);
-        }
+    if (this->isCancel->load()) return;
 
-#ifdef BOREALIS_USE_GXM
-        if (imageData) {
-            size_t size = nearest_po2(imageW) * nearest_po2(imageH);
-            if (!isWebp) size >>= 1;
-            auto* compressed = (uint8_t*)malloc(size);
-            dxt_compress(compressed, imageData, imageW, imageH, isWebp);
-#ifdef USE_WEBP
-            if (isWebp)
-                WebPFree(imageData);
-            else
-#endif
-                stbi_image_free(imageData);
+    HTTP::set_option(s, this->isCancel, HTTP::Timeout{});
+    bool isFallback = false;
+    for (;;) {
+        try {
+            std::ostringstream body;
+            const int maxAttempts = isFallback ? 1 : 3;
+            for (int attempt = 0; attempt < maxAttempts; ++attempt) {
+                if (this->isCancel->load()) return;
+                body.str("");
+                body.clear();
+                try {
+                    s._get(this->url, &body);
+                    break;
+                } catch (const std::exception& ex) {
+                    // HTTP status failures (notably missing artwork) do not benefit from retries.
+                    if (this->isCancel->load() || attempt + 1 == maxAttempts ||
+                        std::string(ex.what()).rfind("http status ", 0) == 0)
+                        throw;
 
-            imageData = compressed;
-        }
-#endif
-        auto imagePtr = this->image;
-        auto urlCopy = this->url;
-        auto isCancelCopy = this->isCancel;
-
-        brls::Logger::verbose("request Image {} size {}", urlCopy, data.size());
-        brls::sync([imagePtr, urlCopy, isCancelCopy, imageData, imageW, imageH, isWebp] {
-            if (!isCancelCopy->load()) {
-                // Load texture
-                int tex = brls::TextureCache::instance().getCache(urlCopy);
-                if (tex == 0 && imageData != nullptr) {
-                    NVGcontext* vg = brls::Application::getNVGContext();
-#ifdef BOREALIS_USE_GXM
-                    tex = nvgCreateImageRGBA(
-                        vg, imageW, imageH, (isWebp ? NVG_IMAGE_DXT5 : NVG_IMAGE_DXT1) | NVG_IMAGE_LPDDR, imageData);
-#else
-                    tex = nvgCreateImageRGBA(vg, imageW, imageH, 0, imageData);
-#endif
-                    brls::TextureCache::instance().addCache(urlCopy, tex);
+                    // Plain local, not static/thread_local (Switch homebrew's TLS
+                    // support is unreliable for a dynamically-initialized object).
+                    // mt19937, not minstd_rand: confirmed via a real crash dump
+                    // that minstd_rand's internal modulus reduction
+                    // (std::__detail::_Mod::__calc) segfaults on this toolchain --
+                    // mt19937 is the engine already used elsewhere in this
+                    // codebase (misc::randHex) and known to work on Switch.
+                    std::mt19937 rng(static_cast<unsigned>(
+                        std::chrono::steady_clock::now().time_since_epoch().count() ^
+                        std::hash<std::thread::id>{}(std::this_thread::get_id())));
+                    const int baseMs = 300 << attempt;
+                    const int delayMs = baseMs + std::uniform_int_distribution<int>(0, 200 << attempt)(rng);
+                    for (int slept = 0; slept < delayMs && !this->isCancel->load(); slept += 50) {
+                        const int remaining = delayMs - slept;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(remaining < 50 ? remaining : 50));
+                    }
                 }
-                if (tex > 0) imagePtr->innerSetImage(tex);
-                clear(imagePtr);
             }
-            if (imageData) {
+            if (this->isCancel->load()) return;
+            std::string data = body.str();
+            uint8_t* imageData = nullptr;
+            int imageW = 0, imageH = 0;
+            bool isWebp = false;
+#ifdef USE_WEBP
+            char* ct = nullptr;
+            if (url.find("Webp") != std::string::npos || (s.getinfo(&ct) && strcmp(ct, "image/webp") == 0)) {
+                imageData = WebPDecodeRGBA((const uint8_t*)data.c_str(), data.size(), &imageW, &imageH);
+                isWebp = true;
+            } else
+#endif
+            {
+                int n;
+                imageData = stbi_load_from_memory((unsigned char*)data.c_str(), data.size(), &imageW, &imageH, &n, 4);
+            }
+
 #ifdef BOREALIS_USE_GXM
-                free(imageData);
-#else
+            if (imageData) {
+                size_t size = nearest_po2(imageW) * nearest_po2(imageH);
+                if (!isWebp) size >>= 1;
+                auto* compressed = (uint8_t*)malloc(size);
+                dxt_compress(compressed, imageData, imageW, imageH, isWebp);
 #ifdef USE_WEBP
                 if (isWebp)
                     WebPFree(imageData);
                 else
 #endif
                     stbi_image_free(imageData);
-#endif
+
+                imageData = compressed;
             }
-        });
-    } catch (const std::exception& ex) {
-        // Remember the failure so recycled cells skip this URL from now on.
-        {
-            std::lock_guard<std::mutex> lock(requestMutex);
-            failedUrls.insert(this->url);
+#endif
+            auto imagePtr = this->image;
+            auto urlCopy = this->url;
+            auto isCancelCopy = this->isCancel;
+
+            brls::Logger::verbose("request Image {} size {}", urlCopy, data.size());
+            brls::sync([imagePtr, urlCopy, isCancelCopy, imageData, imageW, imageH, isWebp] {
+                if (!isCancelCopy->load()) {
+                    // Load texture
+                    int tex = brls::TextureCache::instance().getCache(urlCopy);
+                    if (tex == 0 && imageData != nullptr) {
+                        NVGcontext* vg = brls::Application::getNVGContext();
+#ifdef BOREALIS_USE_GXM
+                        tex = nvgCreateImageRGBA(
+                            vg, imageW, imageH, (isWebp ? NVG_IMAGE_DXT5 : NVG_IMAGE_DXT1) | NVG_IMAGE_LPDDR, imageData);
+#else
+                        tex = nvgCreateImageRGBA(vg, imageW, imageH, 0, imageData);
+#endif
+                        brls::TextureCache::instance().addCache(urlCopy, tex);
+                    }
+                    if (tex > 0) imagePtr->innerSetImage(tex);
+                    clear(imagePtr);
+                }
+                if (imageData) {
+#ifdef BOREALIS_USE_GXM
+                    free(imageData);
+#else
+#ifdef USE_WEBP
+                    if (isWebp)
+                        WebPFree(imageData);
+                    else
+#endif
+                        stbi_image_free(imageData);
+#endif
+                }
+            });
+            return;
+        } catch (const std::exception& ex) {
+            if (this->isCancel->load()) return;
+            // Cache only permanently missing artwork. A transient TLS/network
+            // failure must be allowed to recover when this cell is revisited.
+            const std::string error = ex.what();
+            if (error == "http status 404" || error == "http status 410") {
+                std::lock_guard<std::mutex> lock(requestMutex);
+                failedUrls.insert(this->url);
+            }
+            // The fallback URL gets one attempt, as before.
+            if (!isFallback && !this->fallbackUrl.empty()) {
+                brls::Logger::verbose("image fallback {} -> {}", this->url, this->fallbackUrl);
+                this->url = this->fallbackUrl;
+                this->fallbackUrl.clear();
+                isFallback = true;
+                continue;
+            }
+            brls::Logger::warning("request image {} {}", this->url, ex.what());
+            Image::clear(this->image);
+            return;
         }
-        // Try the fallback URL once (e.g. episode thumbnails that 404 fall
-        // back to the series backdrop).
-        if (!this->fallbackUrl.empty() && !this->isCancel->load()) {
-            brls::Logger::verbose("image fallback {} -> {}", this->url, this->fallbackUrl);
-            this->url = this->fallbackUrl;
-            this->fallbackUrl.clear();
-            return this->doRequest(s);
-        }
-        brls::Logger::warning("request image {} {}", this->url, ex.what());
-        Image::clear(this->image);
     }
 }
 
@@ -266,6 +308,8 @@ void Image::clear(brls::Image* view) {
     it->second->image->ptrUnlock();
     it->second->image = nullptr;
     it->second->isCancel->store(true);
-    pool.push_back(it->second);
+    // A cancelled worker still owns the item. Reusing it would reset its
+    // cancellation flag while the old request is waiting to retry.
+    if (it->second.use_count() == 1) pool.push_back(it->second);
     requests.erase(it);
 }

@@ -757,6 +757,11 @@ class View
     void setId(std::string id);
 
     /**
+     * Returns the id of the view, or an empty string if none was set.
+     */
+    std::string getId();
+
+    /**
      * Overrides align items of the parent box.
      *
      * Default is AUTO.

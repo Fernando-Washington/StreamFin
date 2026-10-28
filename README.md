@@ -12,6 +12,35 @@ Browse Cinemeta catalogs, search, open a title page with cast & plot, pick a str
 all natively on the Switch with MPV. No content is included: **you bring your own Stremio stream
 addon URL**, which the app asks for on first launch.
 
+## Download
+
+**Latest: [StreamFin_v5.nro](https://github.com/Fernando-Washington/StreamFin/raw/main/releases/StreamFin_v5.nro)**
+
+Install: copy the `.nro` to `sdmc:/switch/streamfin/` on the SD card (create the folder if needed)
+and launch it from the Homebrew Menu. App data (config, favourites, downloads) lives in the same folder.
+
+Previous versions:
+[v4](https://github.com/Fernando-Washington/StreamFin/raw/main/releases/StreamFin_v4.nro) ·
+[v3](https://github.com/Fernando-Washington/StreamFin/raw/main/releases/StreamFin_v3.nro) ·
+[v2](https://github.com/Fernando-Washington/StreamFin/raw/main/releases/StreamFin_v2.nro) ·
+[v1](https://github.com/Fernando-Washington/StreamFin/raw/main/releases/StreamFin_v1.nro)
+
+### Changelog
+
+- **v5** — Autoplay of the next episode with countdown; per-season intro markers (mark the opening
+  with ZR, skip it on later episodes); Smart Downloads (delete a watched episode and fetch the next);
+  redesigned Downloads screen with series grouping, watched ✓ marks, delete confirmation and a
+  storage bar; new Settings and Addons screens; audio-language preference; faster, progressive
+  stream lists; fix for random "SSL connect error" failures; data folder moved to
+  `sdmc:/switch/streamfin` (old data migrated automatically).
+- **v4** — Offline downloads per season, refined Downloads screen, loading feedback when searching
+  for streams, longer connection timeouts, fixes for downloads stuck in "Downloading" and for an
+  endless spinner when opening a downloaded video.
+- **v3** — First Downloads feature (Downloads and Settings screens, download from the stream picker).
+- **v2** — Same build as v1.
+- **v1** — Sidebar menu, collapsible search bar, Movies/Series split in search results, real
+  stream-quality parser in the picker, fix for the HTTPS error while playing, automatic reconnect.
+
 ## Screenshots
 
 | Home | Title details |
